@@ -321,7 +321,12 @@ def build_items(cfg, collapsed):
 def draw_detail(win, item, h, w):
     draw_box(win, 0, 0, h, w, "Host Details")
     if item is None or item[0] != "host":
-        win.addstr(h//2, max(1,(w-22)//2), "Select a host to view", curses.color_pair(C_BORDER))
+        mid = h // 2
+        try:
+            win.addstr(mid - 1, max(1, (w-22)//2), "Select a host to view", curses.color_pair(C_BORDER))
+            win.addstr(mid + 1, max(1, (w-30)//2), "[A] Add host    [F] Add folder", curses.color_pair(C_HELP))
+        except curses.error:
+            pass
         return
 
     _, folder, hname, data = item
@@ -359,7 +364,7 @@ def draw_detail(win, item, h, w):
             pass
 
     if h > 14:
-        hint = "  [Enter] connect  [E] edit  [D] delete  "
+        hint = "  [Enter] connect  [A] add  [E] edit  [D] delete  "
         try:
             win.addstr(h-2, 2, clamp_str(hint, w-4), curses.color_pair(C_HELP))
         except curses.error:
