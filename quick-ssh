@@ -319,11 +319,9 @@ def build_items(cfg, collapsed):
 
 # ── detail panel ───────────────────────────────────────────────────────────────
 def draw_detail(win, item, h, w):
-    win.erase()
     draw_box(win, 0, 0, h, w, "Host Details")
     if item is None or item[0] != "host":
         win.addstr(h//2, max(1,(w-22)//2), "Select a host to view", curses.color_pair(C_BORDER))
-        win.refresh()
         return
 
     _, folder, hname, data = item
@@ -367,8 +365,6 @@ def draw_detail(win, item, h, w):
         except curses.error:
             pass
 
-    win.refresh()
-
 # ── status bar ─────────────────────────────────────────────────────────────────
 def draw_status(stdscr, h, w, msg=""):
     bar = " quick-ssh  "
@@ -405,28 +401,43 @@ def tui(stdscr):
     status_msg = ""
     status_timer = 0
 
-    while True:
-        stdscr.erase()
-        h, w = stdscr.getmaxyx()
+    h, w = stdscr.getmaxyx()
+    list_w    = max(24, min(40, w // 2))
+    detail_w  = w - list_w
+    content_h = h - 2
+    list_win   = curses.newwin(content_h, list_w, 1, 0)
+    detail_win = curses.newwin(content_h, detail_w, 1, list_w)
+    list_win.keypad(True)
 
+    while True:
+        new_h, new_w = stdscr.getmaxyx()
+        if new_h != h or new_w != w:
+            h, w = new_h, new_w
+            list_w    = max(24, min(40, w // 2))
+            detail_w  = w - list_w
+            content_h = h - 2
+            list_win   = curses.newwin(content_h, list_w, 1, 0)
+            detail_win = curses.newwin(content_h, detail_w, 1, list_w)
+            list_win.keypad(True)
+            stdscr.clearok(True)
+
+        stdscr.erase()
         draw_title(stdscr, w)
 
-        list_w = max(24, min(40, w // 2))
-        detail_w = w - list_w
-        content_h = h - 2  # title + status
+        msg = status_msg if status_timer > 0 else ""
+        draw_status(stdscr, h, w, msg)
+        if status_timer > 0:
+            status_timer -= 1
 
-        # draw panels
-        list_win   = curses.newwin(content_h, list_w, 1, 0)
-        detail_win = curses.newwin(content_h, detail_w, 1, list_w)
-        list_win.keypad(True)
+        # paint stdscr first so sub-windows draw on top
+        stdscr.noutrefresh()
 
+        list_win.erase()
         draw_box(list_win, 0, 0, content_h, list_w, "Hosts")
-        draw_box(detail_win, 0, 0, content_h, detail_w, "Details")
 
         items = build_items(cfg, collapsed)
-        visible = content_h - 2  # inside border
+        visible = content_h - 2
 
-        # clamp cursor
         cursor = max(0, min(cursor, len(items) - 1))
         if cursor < scroll:
             scroll = cursor
@@ -438,7 +449,7 @@ def tui(stdscr):
             if item_idx >= len(items):
                 break
             item = items[item_idx]
-            row = idx + 1  # inside border
+            row = idx + 1
 
             if item[0] == "folder":
                 folder = item[1]
@@ -464,16 +475,14 @@ def tui(stdscr):
                 except curses.error:
                     pass
 
-        list_win.refresh()
+        list_win.noutrefresh()
 
         cur_item = items[cursor] if items else None
+        detail_win.erase()
         draw_detail(detail_win, cur_item, content_h, detail_w)
+        detail_win.noutrefresh()
 
-        msg = status_msg if status_timer > 0 else ""
-        draw_status(stdscr, h, w, msg)
-        if status_timer > 0:
-            status_timer -= 1
-        stdscr.refresh()
+        curses.doupdate()
 
         ch = stdscr.getch()
 
