@@ -1,0 +1,609 @@
+#!/usr/bin/env python3
+"""quick-ssh — elegant interactive SSH host manager"""
+
+import curses
+import json
+import os
+import sys
+import tempfile
+from pathlib import Path
+
+CONFIG_FILE = Path.home() / ".config" / "quick-ssh" / "hosts.json"
+
+# ── default sample data ────────────────────────────────────────────────────────
+DEFAULT_CONFIG = {
+    "folders": {
+        "Home": {
+            "NAS01": {"host": "192.168.1.10", "user": "admin", "port": 22, "key": ""},
+            "Raspberry Pi": {"host": "192.168.1.20", "user": "pi", "port": 22, "key": ""},
+        },
+        "Work": {
+            "Web Server": {"host": "10.0.0.1", "user": "ubuntu", "port": 22, "key": "~/.ssh/work_key"},
+            "DB Server": {"host": "10.0.0.2", "user": "postgres", "port": 5432, "key": ""},
+        },
+    }
+}
+
+# ── persistence ────────────────────────────────────────────────────────────────
+def load_config():
+    CONFIG_FILE.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if CONFIG_FILE.exists():
+        try:
+            with open(CONFIG_FILE) as f:
+                cfg = json.load(f)
+            if not isinstance(cfg.get("folders"), dict):
+                cfg["folders"] = {}
+            return cfg
+        except (json.JSONDecodeError, OSError):
+            pass  # fall through to write fresh defaults
+    save_config(DEFAULT_CONFIG)
+    return DEFAULT_CONFIG
+
+def save_config(cfg):
+    CONFIG_FILE.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(dir=CONFIG_FILE.parent, suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            os.chmod(f.fileno(), 0o600)
+            json.dump(cfg, f, indent=2)
+        os.replace(tmp_path, CONFIG_FILE)
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
+# ── SSH launch ─────────────────────────────────────────────────────────────────
+def do_ssh(host_data, host_name=""):
+    args = ["ssh"]
+    if host_data.get("key"):
+        args += ["-i", os.path.expanduser(host_data["key"])]
+    port = host_data.get("port", 22)
+    if port != 22:
+        args += ["-p", str(port)]
+    user = host_data.get("user", "")
+    host = host_data.get("host", "")
+    args.append("--")  # prevents host/user values starting with '-' being parsed as options
+    args.append(f"{user}@{host}" if user else host)
+    os.execvp("ssh", args)  # replace process — clean exit after SSH
+
+# ── find host by name across all folders ──────────────────────────────────────
+def find_host(cfg, name):
+    name_lower = name.lower()
+    for folder, hosts in cfg.get("folders", {}).items():
+        for hname, hdata in hosts.items():
+            if hname.lower() == name_lower:
+                return hdata, hname, folder
+    return None, None, None
+
+# ── colour indices ─────────────────────────────────────────────────────────────
+C_TITLE   = 1
+C_BORDER  = 2
+C_FOLDER  = 3
+C_HOST    = 4
+C_SEL     = 5
+C_KEY     = 6
+C_VAL     = 7
+C_STATUS  = 8
+C_HELP    = 9
+C_CONN    = 10
+C_WARN    = 11
+
+def init_colors():
+    curses.start_color()
+    curses.use_default_colors()
+    curses.init_pair(C_TITLE,  curses.COLOR_BLACK,  curses.COLOR_CYAN)
+    curses.init_pair(C_BORDER, curses.COLOR_CYAN,   -1)
+    curses.init_pair(C_FOLDER, curses.COLOR_YELLOW, -1)
+    curses.init_pair(C_HOST,   curses.COLOR_WHITE,  -1)
+    curses.init_pair(C_SEL,    curses.COLOR_BLACK,  curses.COLOR_CYAN)
+    curses.init_pair(C_KEY,    curses.COLOR_CYAN,   -1)
+    curses.init_pair(C_VAL,    curses.COLOR_WHITE,  -1)
+    curses.init_pair(C_STATUS, curses.COLOR_BLACK,  curses.COLOR_BLUE)
+    curses.init_pair(C_HELP,   curses.COLOR_BLACK,  curses.COLOR_WHITE)
+    curses.init_pair(C_CONN,   curses.COLOR_GREEN,  -1)
+    curses.init_pair(C_WARN,   curses.COLOR_RED,    -1)
+
+# ── box-drawing helpers ────────────────────────────────────────────────────────
+def draw_box(win, y, x, h, w, title=""):
+    attr = curses.color_pair(C_BORDER)
+    try:
+        win.attron(attr)
+        win.addch(y,     x,     curses.ACS_ULCORNER)
+        win.addch(y,     x+w-1, curses.ACS_URCORNER)
+        win.addch(y+h-1, x,     curses.ACS_LLCORNER)
+        win.addch(y+h-1, x+w-1, curses.ACS_LRCORNER)
+        win.hline(y,     x+1,   curses.ACS_HLINE, w-2)
+        win.hline(y+h-1, x+1,   curses.ACS_HLINE, w-2)
+        win.vline(y+1,   x,     curses.ACS_VLINE, h-2)
+        win.vline(y+1,   x+w-1, curses.ACS_VLINE, h-2)
+        win.attroff(attr)
+        if title:
+            label = f" {title} "
+            win.addstr(y, x+2, label, attr | curses.A_BOLD)
+    except curses.error:
+        pass
+
+def clamp_str(s, width):
+    s = str(s)
+    if len(s) > width:
+        return s[:width-1] + "…"
+    return s
+
+# ── input dialog ───────────────────────────────────────────────────────────────
+def input_dialog(stdscr, prompt, default="", password=False):
+    """Small centred input box. Returns text or None on ESC."""
+    h, w = stdscr.getmaxyx()
+    bw = min(60, w - 4)
+    bh = 5
+    by = (h - bh) // 2
+    bx = (w - bw) // 2
+
+    panel = curses.newwin(bh, bw, by, bx)
+    curses.curs_set(1)
+    text = list(default)
+    cursor = len(text)
+
+    while True:
+        panel.erase()
+        draw_box(panel, 0, 0, bh, bw)
+        panel.addstr(1, 2, clamp_str(prompt, bw-4), curses.color_pair(C_KEY) | curses.A_BOLD)
+        displayed = "•" * len(text) if password else "".join(text)
+        inner = bw - 4
+        if len(displayed) > inner:
+            displayed = displayed[len(displayed)-inner:]
+        panel.addstr(3, 2, " " * inner)
+        panel.addstr(3, 2, displayed, curses.color_pair(C_VAL))
+        panel.move(3, 2 + min(cursor, inner))
+        panel.refresh()
+
+        ch = panel.getch()
+        if ch in (27,):         # ESC
+            curses.curs_set(0)
+            return None
+        elif ch in (10, 13):    # Enter
+            curses.curs_set(0)
+            return "".join(text)
+        elif ch in (curses.KEY_BACKSPACE, 127, 8):
+            if cursor > 0:
+                text.pop(cursor - 1)
+                cursor -= 1
+        elif ch == curses.KEY_LEFT:
+            cursor = max(0, cursor - 1)
+        elif ch == curses.KEY_RIGHT:
+            cursor = min(len(text), cursor + 1)
+        elif ch == curses.KEY_HOME:
+            cursor = 0
+        elif ch == curses.KEY_END:
+            cursor = len(text)
+        elif 32 <= ch <= 126:
+            text.insert(cursor, chr(ch))
+            cursor += 1
+
+def confirm_dialog(stdscr, prompt):
+    h, w = stdscr.getmaxyx()
+    bw = min(50, w - 4)
+    bh = 5
+    by = (h - bh) // 2
+    bx = (w - bw) // 2
+    panel = curses.newwin(bh, bw, by, bx)
+
+    while True:
+        panel.erase()
+        draw_box(panel, 0, 0, bh, bw, "Confirm")
+        panel.addstr(1, 2, clamp_str(prompt, bw-4), curses.color_pair(C_WARN) | curses.A_BOLD)
+        panel.addstr(3, 2, "  [Y] Yes       [N] No  ", curses.color_pair(C_HELP))
+        panel.refresh()
+        ch = panel.getch()
+        if ch in (ord('y'), ord('Y')):
+            return True
+        if ch in (ord('n'), ord('N'), 27):
+            return False
+
+# ── host edit / add dialog ─────────────────────────────────────────────────────
+def host_dialog(stdscr, cfg, folder=None, host_name=None):
+    """Add or edit a host. Returns True if saved."""
+    editing = host_name is not None
+    if editing:
+        data = cfg["folders"][folder][host_name].copy()
+        old_name = host_name
+    else:
+        data = {"host": "", "user": "", "port": 22, "key": ""}
+        old_name = ""
+
+    folders = list(cfg["folders"].keys())
+    cur_folder = folder or (folders[0] if folders else "")
+
+    fields = [
+        ("Name",    old_name,           False),
+        ("Folder",  cur_folder,         False),
+        ("Host/IP", data.get("host",""),False),
+        ("User",    data.get("user",""),False),
+        ("Port",    str(data.get("port",22)), False),
+        ("SSH Key", data.get("key",""), False),
+    ]
+    field_idx = 0
+    values = [f[1] for f in fields]
+
+    h, w = stdscr.getmaxyx()
+    bw = min(56, w - 4)
+    bh = len(fields) * 2 + 4
+    by = max(1, (h - bh) // 2)
+    bx = (w - bw) // 2
+    title = "Edit Host" if editing else "Add Host"
+
+    while True:
+        panel = curses.newwin(bh, bw, by, bx)
+        panel.keypad(True)
+        panel.erase()
+        draw_box(panel, 0, 0, bh, bw, title)
+
+        for i, (label, _, pw) in enumerate(fields):
+            row = 1 + i * 2
+            attr = curses.color_pair(C_SEL) | curses.A_BOLD if i == field_idx else curses.color_pair(C_KEY)
+            panel.addstr(row, 2, f"{label:<10}", attr)
+            val_attr = curses.color_pair(C_VAL)
+            val = clamp_str(values[i], bw - 14)
+            panel.addstr(row, 13, val, val_attr)
+            if i == field_idx:
+                panel.addstr(row, 13 + len(val), "█", curses.color_pair(C_CONN))
+
+        hint = " [Enter] edit  [Tab/↑↓] move  [S] save  [Esc] cancel "
+        panel.addstr(bh-1, max(2, (bw - len(hint))//2), hint[:bw-2], curses.color_pair(C_HELP))
+        panel.refresh()
+
+        ch = panel.getch()
+        if ch == 27:
+            return False
+        elif ch in (ord('s'), ord('S')):
+            break
+        elif ch in (9, curses.KEY_DOWN):
+            field_idx = (field_idx + 1) % len(fields)
+        elif ch in (curses.KEY_UP, curses.KEY_BTAB):
+            field_idx = (field_idx - 1) % len(fields)
+        elif ch in (10, 13):
+            label = fields[field_idx][0]
+            current = values[field_idx]
+            if label == "Folder":
+                result = input_dialog(stdscr, "Folder (new or existing):", current)
+            else:
+                result = input_dialog(stdscr, f"{label}:", current)
+            if result is not None:
+                values[field_idx] = result
+
+    name    = values[0].strip()
+    folder  = values[1].strip() or "Default"
+    host    = values[2].strip()
+    user    = values[3].strip()
+    port_s  = values[4].strip()
+    key     = values[5].strip()
+
+    if not name or not host:
+        return False
+
+    try:
+        port = int(port_s)
+    except ValueError:
+        port = 22
+
+    if editing:
+        # Remove old entry from its original folder; handles rename and folder-move
+        old_folder_hosts = cfg["folders"].get(cur_folder, {})
+        if old_name in old_folder_hosts and (old_name != name or cur_folder != folder):
+            del old_folder_hosts[old_name]
+            if not old_folder_hosts:
+                del cfg["folders"][cur_folder]
+
+    if folder not in cfg["folders"]:
+        cfg["folders"][folder] = {}
+    cfg["folders"][folder][name] = {
+        "host": host,
+        "user": user,
+        "port": port,
+        "key":  key,
+    }
+    save_config(cfg)
+    return True
+
+# ── build flat navigation list ─────────────────────────────────────────────────
+def build_items(cfg, collapsed):
+    """Returns list of (type, folder, host_name, host_data)."""
+    items = []
+    for folder in sorted(cfg.get("folders", {}).keys()):
+        items.append(("folder", folder, None, None))
+        if folder not in collapsed:
+            for hname in sorted(cfg["folders"][folder].keys()):
+                items.append(("host", folder, hname, cfg["folders"][folder][hname]))
+    return items
+
+# ── detail panel ───────────────────────────────────────────────────────────────
+def draw_detail(win, item, h, w):
+    win.erase()
+    draw_box(win, 0, 0, h, w, "Host Details")
+    if item is None or item[0] != "host":
+        win.addstr(h//2, max(1,(w-22)//2), "Select a host to view", curses.color_pair(C_BORDER))
+        win.refresh()
+        return
+
+    _, folder, hname, data = item
+    inner_w = w - 4
+
+    def row(y, key, val, kattr=C_KEY, vattr=C_VAL):
+        try:
+            win.addstr(y, 2, f"{key:<12}", curses.color_pair(kattr) | curses.A_BOLD)
+            win.addstr(y, 14, clamp_str(val, inner_w - 12), curses.color_pair(vattr))
+        except curses.error:
+            pass
+
+    row(2,  "Name",   hname,                   C_CONN)
+    row(3,  "Folder", folder,                  C_FOLDER)
+    row(5,  "Host",   data.get("host","—"))
+    row(6,  "User",   data.get("user","—"))
+    row(7,  "Port",   str(data.get("port",22)))
+    key = data.get("key","")
+    row(8,  "SSH Key", key if key else "default (~/.ssh/id_rsa)")
+
+    cmd = "ssh "
+    if data.get("key"):
+        cmd += f"-i {data['key']} "
+    if data.get("port", 22) != 22:
+        cmd += f"-p {data['port']} "
+    user = data.get("user","")
+    host = data.get("host","")
+    cmd += f"{user+'@' if user else ''}{host}"
+
+    if h > 12:
+        try:
+            win.addstr(10, 2, "Command", curses.color_pair(C_KEY) | curses.A_BOLD)
+            win.addstr(11, 2, clamp_str(cmd, w-4), curses.color_pair(C_BORDER))
+        except curses.error:
+            pass
+
+    if h > 14:
+        hint = "  [Enter] connect  [E] edit  [D] delete  "
+        try:
+            win.addstr(h-2, 2, clamp_str(hint, w-4), curses.color_pair(C_HELP))
+        except curses.error:
+            pass
+
+    win.refresh()
+
+# ── status bar ─────────────────────────────────────────────────────────────────
+def draw_status(stdscr, h, w, msg=""):
+    bar = " quick-ssh  "
+    keys = "[↑↓] navigate  [Enter] connect  [A] add  [E] edit  [D] delete  [Q] quit"
+    if msg:
+        keys = msg
+    line = bar + keys
+    try:
+        stdscr.addstr(h-1, 0, " " * w, curses.color_pair(C_STATUS))
+        stdscr.addstr(h-1, 0, clamp_str(line, w-1), curses.color_pair(C_STATUS) | curses.A_BOLD)
+    except curses.error:
+        pass
+
+# ── title bar ──────────────────────────────────────────────────────────────────
+def draw_title(stdscr, w):
+    title = "  ⚡ quick-ssh — SSH Host Manager  "
+    pad = " " * w
+    try:
+        stdscr.addstr(0, 0, pad, curses.color_pair(C_TITLE))
+        stdscr.addstr(0, max(0, (w - len(title)) // 2), title, curses.color_pair(C_TITLE) | curses.A_BOLD)
+    except curses.error:
+        pass
+
+# ── main TUI ───────────────────────────────────────────────────────────────────
+def tui(stdscr):
+    curses.curs_set(0)
+    stdscr.keypad(True)
+    init_colors()
+
+    cfg = load_config()
+    collapsed = set()
+    cursor = 0
+    scroll = 0
+    status_msg = ""
+    status_timer = 0
+
+    while True:
+        stdscr.erase()
+        h, w = stdscr.getmaxyx()
+
+        draw_title(stdscr, w)
+
+        list_w = max(24, min(40, w // 2))
+        detail_w = w - list_w
+        content_h = h - 2  # title + status
+
+        # draw panels
+        list_win   = curses.newwin(content_h, list_w, 1, 0)
+        detail_win = curses.newwin(content_h, detail_w, 1, list_w)
+        list_win.keypad(True)
+
+        draw_box(list_win, 0, 0, content_h, list_w, "Hosts")
+        draw_box(detail_win, 0, 0, content_h, detail_w, "Details")
+
+        items = build_items(cfg, collapsed)
+        visible = content_h - 2  # inside border
+
+        # clamp cursor
+        cursor = max(0, min(cursor, len(items) - 1))
+        if cursor < scroll:
+            scroll = cursor
+        elif cursor >= scroll + visible:
+            scroll = cursor - visible + 1
+
+        for idx in range(visible):
+            item_idx = scroll + idx
+            if item_idx >= len(items):
+                break
+            item = items[item_idx]
+            row = idx + 1  # inside border
+
+            if item[0] == "folder":
+                folder = item[1]
+                icon = "▼" if folder not in collapsed else "▶"
+                label = f" {icon} {folder}"
+                attr = curses.color_pair(C_FOLDER) | curses.A_BOLD
+                if item_idx == cursor:
+                    attr = curses.color_pair(C_SEL) | curses.A_BOLD
+                try:
+                    list_win.addstr(row, 1, " " * (list_w - 2))
+                    list_win.addstr(row, 1, clamp_str(label, list_w - 3), attr)
+                except curses.error:
+                    pass
+            else:
+                hname = item[2]
+                label = f"    {hname}"
+                attr = curses.color_pair(C_HOST)
+                if item_idx == cursor:
+                    attr = curses.color_pair(C_SEL) | curses.A_BOLD
+                try:
+                    list_win.addstr(row, 1, " " * (list_w - 2))
+                    list_win.addstr(row, 1, clamp_str(label, list_w - 3), attr)
+                except curses.error:
+                    pass
+
+        list_win.refresh()
+
+        cur_item = items[cursor] if items else None
+        draw_detail(detail_win, cur_item, content_h, detail_w)
+
+        msg = status_msg if status_timer > 0 else ""
+        draw_status(stdscr, h, w, msg)
+        if status_timer > 0:
+            status_timer -= 1
+        stdscr.refresh()
+
+        ch = stdscr.getch()
+
+        if ch in (ord('q'), ord('Q')):
+            break
+
+        elif ch in (curses.KEY_UP, ord('k')):
+            cursor = max(0, cursor - 1)
+
+        elif ch in (curses.KEY_DOWN, ord('j')):
+            cursor = min(len(items) - 1, cursor + 1)
+
+        elif ch in (curses.KEY_PPAGE,):
+            cursor = max(0, cursor - visible)
+
+        elif ch in (curses.KEY_NPAGE,):
+            cursor = min(len(items) - 1, cursor + visible)
+
+        elif ch in (9, curses.KEY_RIGHT):  # Tab / right — skip to next folder
+            for i in range(cursor + 1, len(items)):
+                if items[i][0] == "folder":
+                    cursor = i
+                    break
+
+        elif ch == curses.KEY_LEFT:  # left — skip to prev folder
+            for i in range(cursor - 1, -1, -1):
+                if items[i][0] == "folder":
+                    cursor = i
+                    break
+
+        elif ch in (10, 13, ord(' ')):
+            if cur_item:
+                if cur_item[0] == "folder":
+                    folder = cur_item[1]
+                    if folder in collapsed:
+                        collapsed.discard(folder)
+                    else:
+                        collapsed.add(folder)
+                elif cur_item[0] == "host":
+                    curses.endwin()
+                    do_ssh(cur_item[3], cur_item[2])
+
+        elif ch in (ord('a'), ord('A')):
+            folder = cur_item[1] if cur_item else None
+            saved = host_dialog(stdscr, cfg, folder=folder)
+            if saved:
+                status_msg = "Host saved."
+                status_timer = 8
+
+        elif ch in (ord('e'), ord('E')):
+            if cur_item and cur_item[0] == "host":
+                saved = host_dialog(stdscr, cfg, folder=cur_item[1], host_name=cur_item[2])
+                if saved:
+                    status_msg = "Host updated."
+                    status_timer = 8
+
+        elif ch in (ord('d'), ord('D')):
+            if cur_item and cur_item[0] == "host":
+                if confirm_dialog(stdscr, f"Delete '{cur_item[2]}'?"):
+                    del cfg["folders"][cur_item[1]][cur_item[2]]
+                    if not cfg["folders"][cur_item[1]]:
+                        del cfg["folders"][cur_item[1]]
+                    save_config(cfg)
+                    cursor = max(0, cursor - 1)
+                    status_msg = "Host deleted."
+                    status_timer = 8
+
+        elif ch in (ord('f'), ord('F')):
+            # Add folder
+            name = input_dialog(stdscr, "New folder name:")
+            if name and name.strip():
+                name = name.strip()
+                if name not in cfg["folders"]:
+                    cfg["folders"][name] = {}
+                    save_config(cfg)
+                    status_msg = f"Folder '{name}' created."
+                    status_timer = 8
+
+        elif ch == curses.KEY_RESIZE:
+            stdscr.clear()
+
+# ── CLI entry ──────────────────────────────────────────────────────────────────
+VERSION = "1.0.0"
+
+def main():
+    if len(sys.argv) > 1:
+        arg = sys.argv[1]
+
+        if arg in ("-v", "--version"):
+            print(f"quick-ssh {VERSION}")
+            return
+
+        if arg in ("-h", "--help"):
+            print(f"""\
+quick-ssh {VERSION} — elegant interactive SSH host manager
+https://github.com/yourname/quick-ssh
+
+Usage:
+  quick-ssh               Open the interactive TUI
+  quick-ssh <name>        Connect directly to a saved host by name
+  quick-ssh -v            Print version and exit
+  quick-ssh -h            Show this help and exit
+
+Config: {CONFIG_FILE}
+
+Keys (TUI):
+  ↑ ↓ / j k      Navigate hosts
+  Enter / Space   Connect to host · expand/collapse folder
+  Tab / →         Jump to next folder
+  ←               Jump to previous folder
+  A               Add host
+  E               Edit host
+  D               Delete host
+  F               Add folder
+  Q               Quit\
+""")
+            return
+
+        cfg = load_config()
+        data, hname, folder = find_host(cfg, arg)
+        if data is None:
+            print(f"quick-ssh: host '{arg}' not found in {CONFIG_FILE}")
+            sys.exit(1)
+        print(f"Connecting to {hname} ({data.get('user','')+'@' if data.get('user') else ''}{data['host']})…")
+        do_ssh(data, hname)
+    else:
+        try:
+            curses.wrapper(tui)
+        except KeyboardInterrupt:
+            pass
+
+if __name__ == "__main__":
+    main()
